@@ -19,6 +19,7 @@
 
 import math
 import sys
+import time
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 from copy import copy, deepcopy
@@ -375,6 +376,16 @@ class NPUModelRunner(GPUModelRunner):
         self.reorder_batch_threshold: int | None = None
         self.long_seq_metadata = None
         self.cpu_slot_mapping = None
+
+        # Model forward statistics tracking
+        self.track_model_forward_stats = True  # Enable/disable tracking
+        self.model_forward_stats = {
+            "total_tokens": 0,
+            "total_forward_time_ms": 0.0,
+            "total_num_calls": 0,
+            "stats_by_parallel_config": {},  # Group by (tp_size, cp_size, dp_size, pp_size)
+            "stats_by_token_range": {},  # Group by token range (e.g., "1-10", "10-100", "100+")
+        }
 
     @property
     def use_cp(self) -> bool:
@@ -1259,9 +1270,20 @@ class NPUModelRunner(GPUModelRunner):
             ),
             self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
         ):
+            # Track model forward statistics
+            if self.track_model_forward_stats:
+                forward_start_time = time.perf_counter()
+
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
+
+            if self.track_model_forward_stats:
+                forward_end_time = time.perf_counter()
+                forward_time_ms = (forward_end_time - forward_start_time) * 1000.0
+                self._record_model_forward_stats(
+                    num_tokens_padded, num_tokens_across_dp, cudagraph_mode, forward_time_ms
+                )
         with record_function_or_nullcontext("post process"):
             if self.pcp_size > 1:
                 # NOTE we must `slice` hidden_states because pcp_allgather_restore_idx
@@ -1642,6 +1664,78 @@ class NPUModelRunner(GPUModelRunner):
                 NPUModelRunner._all_gather_hidden_states_list(hidden_states[1]),
             )
         return NPUModelRunner._all_gather_hidden_states(hidden_states)
+
+    def _record_model_forward_stats(
+        self,
+        num_tokens_padded: int,
+        num_tokens_across_dp: int | None,
+        cudagraph_mode: CUDAGraphMode,
+        forward_time_ms: float,
+    ) -> None:
+        """Record statistics for model forward execution."""
+        # Get parallel configuration information
+        tp_size = self.vllm_config.parallel_config.tensor_parallel_size
+        cp_size = self.vllm_config.parallel_config.prefill_context_parallel_size
+        dp_size = self.dp_size
+        pp_size = get_pp_group().world_size
+        pp_rank = get_pp_group().rank_in_group
+
+        # Use the actual token count considering parallel strategies
+        # In DP mode, num_tokens_across_dp represents tokens across all DP ranks
+        # In SP mode, num_tokens_padded is already padded for TP
+        actual_num_tokens = num_tokens_across_dp if num_tokens_across_dp is not None else num_tokens_padded
+
+        # Update global statistics (only on last PP rank)
+        if pp_rank == pp_size - 1:
+            self.model_forward_stats["total_tokens"] += actual_num_tokens
+            self.model_forward_stats["total_forward_time_ms"] += forward_time_ms
+            self.model_forward_stats["total_num_calls"] += 1
+
+            # Group by parallel configuration
+            parallel_key = f"tp{tp_size}_cp{cp_size}_dp{dp_size}_pp{pp_size}"
+            if parallel_key not in self.model_forward_stats["stats_by_parallel_config"]:
+                self.model_forward_stats["stats_by_parallel_config"][parallel_key] = {
+                    "total_tokens": 0,
+                    "total_forward_time_ms": 0.0,
+                    "total_num_calls": 0,
+                }
+            self.model_forward_stats["stats_by_parallel_config"][parallel_key]["total_tokens"] += actual_num_tokens
+            self.model_forward_stats["stats_by_parallel_config"][parallel_key][
+                "total_forward_time_ms"
+            ] += forward_time_ms
+            self.model_forward_stats["stats_by_parallel_config"][parallel_key]["total_num_calls"] += 1
+
+            # Group by token range
+            if actual_num_tokens <= 10:
+                token_range_key = "1-10"
+            elif actual_num_tokens <= 100:
+                token_range_key = "11-100"
+            elif actual_num_tokens <= 1000:
+                token_range_key = "101-1000"
+            elif actual_num_tokens <= 10000:
+                token_range_key = "1001-10000"
+            else:
+                token_range_key = "10000+"
+
+            if token_range_key not in self.model_forward_stats["stats_by_token_range"]:
+                self.model_forward_stats["stats_by_token_range"][token_range_key] = {
+                    "total_tokens": 0,
+                    "total_forward_time_ms": 0.0,
+                    "total_num_calls": 0,
+                    "min_time_ms": float("inf"),
+                    "max_time_ms": 0.0,
+                }
+            self.model_forward_stats["stats_by_token_range"][token_range_key]["total_tokens"] += actual_num_tokens
+            self.model_forward_stats["stats_by_token_range"][token_range_key][
+                "total_forward_time_ms"
+            ] += forward_time_ms
+            self.model_forward_stats["stats_by_token_range"][token_range_key]["total_num_calls"] += 1
+            self.model_forward_stats["stats_by_token_range"][token_range_key][
+                "min_time_ms"
+            ] = min(self.model_forward_stats["stats_by_token_range"][token_range_key]["min_time_ms"], forward_time_ms)
+            self.model_forward_stats["stats_by_token_range"][token_range_key][
+                "max_time_ms"
+            ] = max(self.model_forward_stats["stats_by_token_range"][token_range_key]["max_time_ms"], forward_time_ms)
 
     def _model_forward(
         self,
@@ -3001,6 +3095,76 @@ def _torch_cuda_wrapper():
         torch.cuda.stream = torch.npu.stream
         torch.cuda.synchronize = torch.npu.synchronize
         torch.cuda.mem_get_info = torch.npu.mem_get_info
+
+    def get_model_forward_stats(self) -> dict[str, Any]:
+        """Return the model forward statistics."""
+        return self.model_forward_stats.copy()
+
+    def print_model_forward_stats(self) -> None:
+        """Print the model forward statistics in a formatted way."""
+        stats = self.model_forward_stats
+        if stats["total_num_calls"] == 0:
+            logger.info("No model forward statistics collected yet.")
+            return
+
+        logger.info("=" * 80)
+        logger.info("Model Forward Statistics")
+        logger.info("=" * 80)
+        logger.info(f"Total calls: {stats['total_num_calls']}")
+        logger.info(f"Total tokens: {stats['total_tokens']}")
+        logger.info(f"Total forward time: {stats['total_forward_time_ms']:.2f} ms")
+        logger.info(f"Average time per call: {stats['total_forward_time_ms'] / stats['total_num_calls']:.2f} ms")
+        logger.info(f"Average time per token: {stats['total_forward_time_ms'] / stats['total_tokens']:.4f} ms")
+        logger.info(f"Average tokens per second: {stats['total_tokens'] / (stats['total_forward_time_ms'] / 1000):.2f}")
+        logger.info("")
+
+        # Statistics by parallel configuration
+        logger.info("Statistics by Parallel Configuration:")
+        logger.info("-" * 80)
+        for parallel_key, parallel_stats in sorted(stats["stats_by_parallel_config"].items()):
+            logger.info(f"  {parallel_key}:")
+            logger.info(f"    Total calls: {parallel_stats['total_num_calls']}")
+            logger.info(f"    Total tokens: {parallel_stats['total_tokens']}")
+            logger.info(f"    Total forward time: {parallel_stats['total_forward_time_ms']:.2f} ms")
+            logger.info(
+                f"    Average time per call: {parallel_stats['total_forward_time_ms'] / parallel_stats['total_num_calls']:.2f} ms"
+            )
+            logger.info(
+                f"    Average tokens per second: {parallel_stats['total_tokens'] / (parallel_stats['total_forward_time_ms'] / 1000):.2f}"
+            )
+        logger.info("")
+
+        # Statistics by token range
+        logger.info("Statistics by Token Range:")
+        logger.info("-" * 80)
+        for range_key in ["1-10", "11-100", "101-1000", "1001-10000", "10000+"]:
+            if range_key in stats["stats_by_token_range"]:
+                range_stats = stats["stats_by_token_range"][range_key]
+                logger.info(f"  {range_key} tokens:")
+                logger.info(f"    Total calls: {range_stats['total_num_calls']}")
+                logger.info(f"    Total tokens: {range_stats['total_tokens']}")
+                logger.info(f"    Total forward time: {range_stats['total_forward_time_ms']:.2f} ms")
+                logger.info(
+                    f"    Average time per call: {range_stats['total_forward_time_ms'] / range_stats['total_num_calls']:.2f} ms"
+                )
+                logger.info(f"    Min time per call: {range_stats['min_time_ms']:.2f} ms")
+                logger.info(f"    Max time per call: {range_stats['max_time_ms']:.2f} ms")
+                logger.info(
+                    f"    Average tokens per second: {range_stats['total_tokens'] / (range_stats['total_forward_time_ms'] / 1000):.2f}"
+                )
+        logger.info("=" * 80)
+
+    def reset_model_forward_stats(self) -> None:
+        """Reset the model forward statistics."""
+        pp_rank = get_pp_group().rank_in_group
+        if pp_rank == get_pp_group().world_size - 1:
+            self.model_forward_stats = {
+                "total_tokens": 0,
+                "total_forward_time_ms": 0.0,
+                "total_num_calls": 0,
+                "stats_by_parallel_config": {},
+                "stats_by_token_range": {},
+            }
 
 
 # TODO: This method will be removed subsequently and implemented in platform.
