@@ -379,12 +379,14 @@ class NPUModelRunner(GPUModelRunner):
 
         # Model forward statistics tracking
         self.track_model_forward_stats = True  # Enable/disable tracking
+        self.model_forward_history = []  # Store each forward result separately
+        self.max_history_size = 1000  # Maximum number of records to keep
+
+        # Aggregated statistics (for summary)
         self.model_forward_stats = {
-            "total_tokens": 0,
-            "total_forward_time_ms": 0.0,
-            "total_num_calls": 0,
-            "stats_by_parallel_config": {},  # Group by (tp_size, cp_size, dp_size, pp_size)
-            "stats_by_token_range": {},  # Group by token range (e.g., "1-10", "10-100", "100+")
+            "last_forward_tokens": 0,
+            "last_forward_time_ms": 0.0,
+            "num_calls": 0,
         }
 
     @property
@@ -1685,57 +1687,33 @@ class NPUModelRunner(GPUModelRunner):
         # In SP mode, num_tokens_padded is already padded for TP
         actual_num_tokens = num_tokens_across_dp if num_tokens_across_dp is not None else num_tokens_padded
 
-        # Update global statistics (only on last PP rank)
+        # Only record on last PP rank to avoid duplicates
         if pp_rank == pp_size - 1:
-            self.model_forward_stats["total_tokens"] += actual_num_tokens
-            self.model_forward_stats["total_forward_time_ms"] += forward_time_ms
-            self.model_forward_stats["total_num_calls"] += 1
+            # Store each forward result separately
+            record = {
+                "timestamp": time.time(),
+                "tokens": actual_num_tokens,
+                "forward_time_ms": forward_time_ms,
+                "parallel_config": {
+                    "tp_size": tp_size,
+                    "cp_size": cp_size,
+                    "dp_size": dp_size,
+                    "pp_size": pp_size,
+                    "pp_rank": pp_rank,
+                },
+                "cuda_graph_mode": cudagraph_mode.name if cudagraph_mode else None,
+                "tokens_per_second": actual_num_tokens / (forward_time_ms / 1000.0),
+            }
 
-            # Group by parallel configuration
-            parallel_key = f"tp{tp_size}_cp{cp_size}_dp{dp_size}_pp{pp_size}"
-            if parallel_key not in self.model_forward_stats["stats_by_parallel_config"]:
-                self.model_forward_stats["stats_by_parallel_config"][parallel_key] = {
-                    "total_tokens": 0,
-                    "total_forward_time_ms": 0.0,
-                    "total_num_calls": 0,
-                }
-            self.model_forward_stats["stats_by_parallel_config"][parallel_key]["total_tokens"] += actual_num_tokens
-            self.model_forward_stats["stats_by_parallel_config"][parallel_key][
-                "total_forward_time_ms"
-            ] += forward_time_ms
-            self.model_forward_stats["stats_by_parallel_config"][parallel_key]["total_num_calls"] += 1
+            # Add to history with size limit
+            self.model_forward_history.append(record)
+            if len(self.model_forward_history) > self.max_history_size:
+                self.model_forward_history.pop(0)
 
-            # Group by token range
-            if actual_num_tokens <= 10:
-                token_range_key = "1-10"
-            elif actual_num_tokens <= 100:
-                token_range_key = "11-100"
-            elif actual_num_tokens <= 1000:
-                token_range_key = "101-1000"
-            elif actual_num_tokens <= 10000:
-                token_range_key = "1001-10000"
-            else:
-                token_range_key = "10000+"
-
-            if token_range_key not in self.model_forward_stats["stats_by_token_range"]:
-                self.model_forward_stats["stats_by_token_range"][token_range_key] = {
-                    "total_tokens": 0,
-                    "total_forward_time_ms": 0.0,
-                    "total_num_calls": 0,
-                    "min_time_ms": float("inf"),
-                    "max_time_ms": 0.0,
-                }
-            self.model_forward_stats["stats_by_token_range"][token_range_key]["total_tokens"] += actual_num_tokens
-            self.model_forward_stats["stats_by_token_range"][token_range_key][
-                "total_forward_time_ms"
-            ] += forward_time_ms
-            self.model_forward_stats["stats_by_token_range"][token_range_key]["total_num_calls"] += 1
-            self.model_forward_stats["stats_by_token_range"][token_range_key][
-                "min_time_ms"
-            ] = min(self.model_forward_stats["stats_by_token_range"][token_range_key]["min_time_ms"], forward_time_ms)
-            self.model_forward_stats["stats_by_token_range"][token_range_key][
-                "max_time_ms"
-            ] = max(self.model_forward_stats["stats_by_token_range"][token_range_key]["max_time_ms"], forward_time_ms)
+            # Update last forward stats
+            self.model_forward_stats["last_forward_tokens"] = actual_num_tokens
+            self.model_forward_stats["last_forward_time_ms"] = forward_time_ms
+            self.model_forward_stats["num_calls"] = len(self.model_forward_history)
 
     def _model_forward(
         self,
@@ -3098,73 +3076,150 @@ def _torch_cuda_wrapper():
 
     def get_model_forward_stats(self) -> dict[str, Any]:
         """Return the model forward statistics."""
-        return self.model_forward_stats.copy()
+        return {
+            "last_forward": self.model_forward_stats,
+            "history": self.model_forward_history.copy(),
+            "history_size": len(self.model_forward_history),
+        }
 
     def print_model_forward_stats(self) -> None:
         """Print the model forward statistics in a formatted way."""
-        stats = self.model_forward_stats
-        if stats["total_num_calls"] == 0:
+        if not self.model_forward_history:
             logger.info("No model forward statistics collected yet.")
             return
 
         logger.info("=" * 80)
         logger.info("Model Forward Statistics")
         logger.info("=" * 80)
-        logger.info(f"Total calls: {stats['total_num_calls']}")
-        logger.info(f"Total tokens: {stats['total_tokens']}")
-        logger.info(f"Total forward time: {stats['total_forward_time_ms']:.2f} ms")
-        logger.info(f"Average time per call: {stats['total_forward_time_ms'] / stats['total_num_calls']:.2f} ms")
-        logger.info(f"Average time per token: {stats['total_forward_time_ms'] / stats['total_tokens']:.4f} ms")
-        logger.info(f"Average tokens per second: {stats['total_tokens'] / (stats['total_forward_time_ms'] / 1000):.2f}")
+
+        # Print summary of all records
+        total_tokens = sum(record["tokens"] for record in self.model_forward_history)
+        total_time = sum(record["forward_time_ms"] for record in self.model_forward_history)
+        avg_tokens_per_second = total_tokens / (total_time / 1000.0) if total_time > 0 else 0
+
+        logger.info(f"Total records: {len(self.model_forward_history)}")
+        logger.info(f"Total tokens: {total_tokens}")
+        logger.info(f"Total forward time: {total_time:.2f} ms")
+        logger.info(f"Average tokens per second: {avg_tokens_per_second:.2f}")
         logger.info("")
 
-        # Statistics by parallel configuration
+        # Print last forward result
+        if self.model_forward_stats["num_calls"] > 0:
+            last_record = self.model_forward_history[-1]
+            logger.info("Last Forward Result:")
+            logger.info("-" * 40)
+            logger.info(f"  Tokens: {last_record['tokens']}")
+            logger.info(f"  Forward time: {last_record['forward_time_ms']:.2f} ms")
+            logger.info(f"  Tokens per second: {last_record['tokens_per_second']:.2f}")
+            logger.info(f"  Parallel config: TP{last_record['parallel_config']['tp_size']}_"
+                       f"CP{last_record['parallel_config']['cp_size']}_"
+                       f"DP{last_record['parallel_config']['dp_size']}_"
+                       f"PP{last_record['parallel_config']['pp_size']}")
+            logger.info(f"  CUDA graph mode: {last_record['cuda_graph_mode']}")
+            logger.info("")
+
+        # Print recent history (last 10 records)
+        recent_history = self.model_forward_history[-10:]
+        logger.info("Recent Forward History (last 10 records):")
+        logger.info("-" * 80)
+        logger.info("  #   Tokens  Time(ms)  TPS    TP  CP  DP  PP Mode")
+        logger.info("  --  ------  -------  -----  --  --  --  -- ----")
+        for i, record in enumerate(recent_history, len(self.model_forward_history) - len(recent_history) + 1):
+            parallel_cfg = record["parallel_config"]
+            logger.info(f"  {i:2d}   {record['tokens']:4d}   {record['forward_time_ms']:6.2f}  {record['tokens_per_second']:5.1f}  "
+                       f"{parallel_cfg['tp_size']:2d} {parallel_cfg['cp_size']:2d} {parallel_cfg['dp_size']:2d} {parallel_cfg['pp_size']:2d} "
+                       f"{record['cuda_graph_mode'] or 'N/A'}")
+        logger.info("")
+
+        # Group statistics by parallel configuration
+        stats_by_parallel = {}
+        for record in self.model_forward_history:
+            key = f"TP{record['parallel_config']['tp_size']}_CP{record['parallel_config']['cp_size']}_DP{record['parallel_config']['dp_size']}_PP{record['parallel_config']['pp_size']}"
+            if key not in stats_by_parallel:
+                stats_by_parallel[key] = {
+                    "count": 0,
+                    "tokens": 0,
+                    "time": 0.0,
+                    "min_time": float("inf"),
+                    "max_time": 0.0,
+                }
+            stats_by_parallel[key]["count"] += 1
+            stats_by_parallel[key]["tokens"] += record["tokens"]
+            stats_by_parallel[key]["time"] += record["forward_time_ms"]
+            stats_by_parallel[key]["min_time"] = min(stats_by_parallel[key]["min_time"], record["forward_time_ms"])
+            stats_by_parallel[key]["max_time"] = max(stats_by_parallel[key]["max_time"], record["forward_time_ms"])
+
         logger.info("Statistics by Parallel Configuration:")
         logger.info("-" * 80)
-        for parallel_key, parallel_stats in sorted(stats["stats_by_parallel_config"].items()):
-            logger.info(f"  {parallel_key}:")
-            logger.info(f"    Total calls: {parallel_stats['total_num_calls']}")
-            logger.info(f"    Total tokens: {parallel_stats['total_tokens']}")
-            logger.info(f"    Total forward time: {parallel_stats['total_forward_time_ms']:.2f} ms")
-            logger.info(
-                f"    Average time per call: {parallel_stats['total_forward_time_ms'] / parallel_stats['total_num_calls']:.2f} ms"
-            )
-            logger.info(
-                f"    Average tokens per second: {parallel_stats['total_tokens'] / (parallel_stats['total_forward_time_ms'] / 1000):.2f}"
-            )
-        logger.info("")
-
-        # Statistics by token range
-        logger.info("Statistics by Token Range:")
-        logger.info("-" * 80)
-        for range_key in ["1-10", "11-100", "101-1000", "1001-10000", "10000+"]:
-            if range_key in stats["stats_by_token_range"]:
-                range_stats = stats["stats_by_token_range"][range_key]
-                logger.info(f"  {range_key} tokens:")
-                logger.info(f"    Total calls: {range_stats['total_num_calls']}")
-                logger.info(f"    Total tokens: {range_stats['total_tokens']}")
-                logger.info(f"    Total forward time: {range_stats['total_forward_time_ms']:.2f} ms")
-                logger.info(
-                    f"    Average time per call: {range_stats['total_forward_time_ms'] / range_stats['total_num_calls']:.2f} ms"
-                )
-                logger.info(f"    Min time per call: {range_stats['min_time_ms']:.2f} ms")
-                logger.info(f"    Max time per call: {range_stats['max_time_ms']:.2f} ms")
-                logger.info(
-                    f"    Average tokens per second: {range_stats['total_tokens'] / (range_stats['total_forward_time_ms'] / 1000):.2f}"
-                )
+        for key, stats in sorted(stats_by_parallel.items()):
+            avg_tps = stats["tokens"] / (stats["time"] / 1000.0) if stats["time"] > 0 else 0
+            logger.info(f"  {key}:")
+            logger.info(f"    Records: {stats['count']}")
+            logger.info(f"    Tokens: {stats['tokens']}")
+            logger.info(f"    Total time: {stats['time']:.2f} ms")
+            logger.info(f"    Min/Max time: {stats['min_time']:.2f}/{stats['max_time']:.2f} ms")
+            logger.info(f"    Average TPS: {avg_tps:.2f}")
         logger.info("=" * 80)
 
     def reset_model_forward_stats(self) -> None:
         """Reset the model forward statistics."""
         pp_rank = get_pp_group().rank_in_group
         if pp_rank == get_pp_group().world_size - 1:
+            self.model_forward_history = []
             self.model_forward_stats = {
-                "total_tokens": 0,
-                "total_forward_time_ms": 0.0,
-                "total_num_calls": 0,
-                "stats_by_parallel_config": {},
-                "stats_by_token_range": {},
+                "last_forward_tokens": 0,
+                "last_forward_time_ms": 0.0,
+                "num_calls": 0,
             }
+
+    def get_model_forward_history(
+        self,
+        limit: int = None,
+        offset: int = 0
+    ) -> list[dict]:
+        """Get forward history with optional limit and offset.
+
+        Args:
+            limit: Maximum number of records to return
+            offset: Number of records to skip from the beginning
+        """
+        history = self.model_forward_history[offset:]
+        if limit is not None:
+            history = history[:limit]
+        return history
+
+    def get_statistics_by_token_range(self) -> dict[str, dict]:
+        """Get aggregated statistics grouped by token ranges."""
+        stats = {}
+        for record in self.model_forward_history:
+            tokens = record["tokens"]
+            if tokens <= 10:
+                range_key = "1-10"
+            elif tokens <= 100:
+                range_key = "11-100"
+            elif tokens <= 1000:
+                range_key = "101-1000"
+            elif tokens <= 10000:
+                range_key = "1001-10000"
+            else:
+                range_key = "10000+"
+
+            if range_key not in stats:
+                stats[range_key] = {
+                    "count": 0,
+                    "tokens": 0,
+                    "total_time_ms": 0.0,
+                    "min_time_ms": float("inf"),
+                    "max_time_ms": 0.0,
+                }
+
+            stats[range_key]["count"] += 1
+            stats[range_key]["tokens"] += tokens
+            stats[range_key]["total_time_ms"] += record["forward_time_ms"]
+            stats[range_key]["min_time_ms"] = min(stats[range_key]["min_time_ms"], record["forward_time_ms"])
+            stats[range_key]["max_time_ms"] = max(stats[range_key]["max_time_ms"], record["forward_time_ms"])
+
+        return stats
 
 
 # TODO: This method will be removed subsequently and implemented in platform.
