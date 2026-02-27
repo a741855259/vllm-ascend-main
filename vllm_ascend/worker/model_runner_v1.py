@@ -51,6 +51,8 @@ from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.attention.selector import get_attn_backend  # type: ignore
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.core.sched.scheduler import FinishReason
+from vllm.v1.metrics.stats import FinishedRequestStats
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     EncoderOnlyAttentionSpec,
@@ -1689,11 +1691,26 @@ class NPUModelRunner(GPUModelRunner):
 
         # Only record on last PP rank to avoid duplicates
         if pp_rank == pp_size - 1:
-            # Store each forward result separately
-            record = {
+            # Store each forward result as FinishedRequestStats
+            # Map the record data to FinishedRequestStats fields
+            forward_stats = FinishedRequestStats(
+                finish_reason=FinishReason.FINISHED,
+                e2e_latency=0.0,  # Not applicable for individual forward
+                num_prompt_tokens=actual_num_tokens,  # For forward level, all tokens are "prompt"
+                num_generation_tokens=actual_num_tokens,
+                max_tokens_param=None,
+                queued_time=0.0,  # Not captured at forward level
+                prefill_time=0.0,  # Not captured at forward level
+                inference_time=forward_time_ms,
+                decode_time=0.0,  # Not captured at forward level
+                mean_time_per_output_token=forward_time_ms / actual_num_tokens if actual_num_tokens > 0 else 0.0,
+                is_corrupted=False,
+                num_cached_tokens=0,  # Not captured at forward level
+            )
+
+            # Create a timestamp record for additional metadata
+            timestamp_record = {
                 "timestamp": time.time(),
-                "tokens": actual_num_tokens,
-                "forward_time_ms": forward_time_ms,
                 "parallel_config": {
                     "tp_size": tp_size,
                     "cp_size": cp_size,
@@ -1702,11 +1719,14 @@ class NPUModelRunner(GPUModelRunner):
                     "pp_rank": pp_rank,
                 },
                 "cuda_graph_mode": cudagraph_mode.name if cudagraph_mode else None,
-                "tokens_per_second": actual_num_tokens / (forward_time_ms / 1000.0),
+                "tokens_per_second": actual_num_tokens / (forward_time_ms / 1000.0) if forward_time_ms > 0 else 0.0,
             }
 
+            # Combine the FinishedRequestStats with timestamp metadata
+            forward_stats.timestamp_data = timestamp_record
+
             # Add to history with size limit
-            self.model_forward_history.append(record)
+            self.model_forward_history.append(forward_stats)
             if len(self.model_forward_history) > self.max_history_size:
                 self.model_forward_history.pop(0)
 
@@ -3076,9 +3096,23 @@ def _torch_cuda_wrapper():
 
     def get_model_forward_stats(self) -> dict[str, Any]:
         """Return the model forward statistics."""
+        # Convert history to list of dicts for easier access
+        history_dicts = []
+        for stats in self.model_forward_history:
+            history_dict = {
+                "num_generation_tokens": stats.num_generation_tokens,
+                "inference_time": stats.inference_time,
+                "mean_time_per_output_token": stats.mean_time_per_output_token,
+                "timestamp": stats.timestamp_data["timestamp"],
+                "parallel_config": stats.timestamp_data["parallel_config"],
+                "cuda_graph_mode": stats.timestamp_data["cuda_graph_mode"],
+                "tokens_per_second": stats.timestamp_data["tokens_per_second"],
+            }
+            history_dicts.append(history_dict)
+
         return {
             "last_forward": self.model_forward_stats,
-            "history": self.model_forward_history.copy(),
+            "history": history_dicts,
             "history_size": len(self.model_forward_history),
         }
 
@@ -3093,8 +3127,8 @@ def _torch_cuda_wrapper():
         logger.info("=" * 80)
 
         # Print summary of all records
-        total_tokens = sum(record["tokens"] for record in self.model_forward_history)
-        total_time = sum(record["forward_time_ms"] for record in self.model_forward_history)
+        total_tokens = sum(stats.num_generation_tokens for stats in self.model_forward_history)
+        total_time = sum(stats.inference_time for stats in self.model_forward_history)
         avg_tokens_per_second = total_tokens / (total_time / 1000.0) if total_time > 0 else 0
 
         logger.info(f"Total records: {len(self.model_forward_history)}")
@@ -3108,14 +3142,14 @@ def _torch_cuda_wrapper():
             last_record = self.model_forward_history[-1]
             logger.info("Last Forward Result:")
             logger.info("-" * 40)
-            logger.info(f"  Tokens: {last_record['tokens']}")
-            logger.info(f"  Forward time: {last_record['forward_time_ms']:.2f} ms")
-            logger.info(f"  Tokens per second: {last_record['tokens_per_second']:.2f}")
-            logger.info(f"  Parallel config: TP{last_record['parallel_config']['tp_size']}_"
-                       f"CP{last_record['parallel_config']['cp_size']}_"
-                       f"DP{last_record['parallel_config']['dp_size']}_"
-                       f"PP{last_record['parallel_config']['pp_size']}")
-            logger.info(f"  CUDA graph mode: {last_record['cuda_graph_mode']}")
+            logger.info(f"  Tokens: {last_record.num_generation_tokens}")
+            logger.info(f"  Forward time: {last_record.inference_time:.2f} ms")
+            logger.info(f"  Tokens per second: {last_record.timestamp_data['tokens_per_second']:.2f}")
+            logger.info(f"  Parallel config: TP{last_record.timestamp_data['parallel_config']['tp_size']}_"
+                       f"CP{last_record.timestamp_data['parallel_config']['cp_size']}_"
+                       f"DP{last_record.timestamp_data['parallel_config']['dp_size']}_"
+                       f"PP{last_record.timestamp_data['parallel_config']['pp_size']}")
+            logger.info(f"  CUDA graph mode: {last_record.timestamp_data['cuda_graph_mode']}")
             logger.info("")
 
         # Print recent history (last 10 records)
@@ -3124,17 +3158,17 @@ def _torch_cuda_wrapper():
         logger.info("-" * 80)
         logger.info("  #   Tokens  Time(ms)  TPS    TP  CP  DP  PP Mode")
         logger.info("  --  ------  -------  -----  --  --  --  -- ----")
-        for i, record in enumerate(recent_history, len(self.model_forward_history) - len(recent_history) + 1):
-            parallel_cfg = record["parallel_config"]
-            logger.info(f"  {i:2d}   {record['tokens']:4d}   {record['forward_time_ms']:6.2f}  {record['tokens_per_second']:5.1f}  "
+        for i, stats in enumerate(recent_history, len(self.model_forward_history) - len(recent_history) + 1):
+            parallel_cfg = stats.timestamp_data["parallel_config"]
+            logger.info(f"  {i:2d}   {stats.num_generation_tokens:4d}   {stats.inference_time:6.2f}  {stats.timestamp_data['tokens_per_second']:5.1f}  "
                        f"{parallel_cfg['tp_size']:2d} {parallel_cfg['cp_size']:2d} {parallel_cfg['dp_size']:2d} {parallel_cfg['pp_size']:2d} "
-                       f"{record['cuda_graph_mode'] or 'N/A'}")
+                       f"{stats.timestamp_data['cuda_graph_mode'] or 'N/A'}")
         logger.info("")
 
         # Group statistics by parallel configuration
         stats_by_parallel = {}
-        for record in self.model_forward_history:
-            key = f"TP{record['parallel_config']['tp_size']}_CP{record['parallel_config']['cp_size']}_DP{record['parallel_config']['dp_size']}_PP{record['parallel_config']['pp_size']}"
+        for stats in self.model_forward_history:
+            key = f"TP{stats.timestamp_data['parallel_config']['tp_size']}_CP{stats.timestamp_data['parallel_config']['cp_size']}_DP{stats.timestamp_data['parallel_config']['dp_size']}_PP{stats.timestamp_data['parallel_config']['pp_size']}"
             if key not in stats_by_parallel:
                 stats_by_parallel[key] = {
                     "count": 0,
@@ -3144,10 +3178,10 @@ def _torch_cuda_wrapper():
                     "max_time": 0.0,
                 }
             stats_by_parallel[key]["count"] += 1
-            stats_by_parallel[key]["tokens"] += record["tokens"]
-            stats_by_parallel[key]["time"] += record["forward_time_ms"]
-            stats_by_parallel[key]["min_time"] = min(stats_by_parallel[key]["min_time"], record["forward_time_ms"])
-            stats_by_parallel[key]["max_time"] = max(stats_by_parallel[key]["max_time"], record["forward_time_ms"])
+            stats_by_parallel[key]["tokens"] += stats.num_generation_tokens
+            stats_by_parallel[key]["time"] += stats.inference_time
+            stats_by_parallel[key]["min_time"] = min(stats_by_parallel[key]["min_time"], stats.inference_time)
+            stats_by_parallel[key]["max_time"] = max(stats_by_parallel[key]["max_time"], stats.inference_time)
 
         logger.info("Statistics by Parallel Configuration:")
         logger.info("-" * 80)
@@ -3192,7 +3226,7 @@ def _torch_cuda_wrapper():
         """Get aggregated statistics grouped by token ranges."""
         stats = {}
         for record in self.model_forward_history:
-            tokens = record["tokens"]
+            tokens = record.num_generation_tokens
             if tokens <= 10:
                 range_key = "1-10"
             elif tokens <= 100:
@@ -3215,9 +3249,9 @@ def _torch_cuda_wrapper():
 
             stats[range_key]["count"] += 1
             stats[range_key]["tokens"] += tokens
-            stats[range_key]["total_time_ms"] += record["forward_time_ms"]
-            stats[range_key]["min_time_ms"] = min(stats[range_key]["min_time_ms"], record["forward_time_ms"])
-            stats[range_key]["max_time_ms"] = max(stats[range_key]["max_time_ms"], record["forward_time_ms"])
+            stats[range_key]["total_time_ms"] += record.inference_time
+            stats[range_key]["min_time_ms"] = min(stats[range_key]["min_time_ms"], record.inference_time)
+            stats[range_key]["max_time_ms"] = max(stats[range_key]["max_time_ms"], record.inference_time)
 
         return stats
 
